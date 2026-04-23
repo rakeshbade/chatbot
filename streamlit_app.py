@@ -82,35 +82,50 @@ def stream_openrouter(api_key, model_id, role, task_prompt, context, task_dict, 
         "stream": True
     }
     
-    task_dict[key_to_update] = ""
+    # Pre-fill so UI immediately knows we are doing something
+    task_dict[key_to_update] = "⏳ Reading sources & thinking..."
     full_text = ""
 
     for i in range(5): 
         try:
-            response = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
+            # Increased timeout for large contexts (TTFT can be long)
+            response = requests.post(url, headers=headers, json=payload, stream=True, timeout=120)
             if response.status_code == 200:
+                task_dict[key_to_update] = ""  # Clear the thinking message
                 for line in response.iter_lines():
                     if line:
                         line = line.decode('utf-8')
                         if line.startswith("data: ") and line != "data: [DONE]":
                             try:
                                 data = json.loads(line[6:])
-                                chunk = data['choices'][0]['delta'].get('content', '')
-                                full_text += chunk
-                                task_dict[key_to_update] = full_text  # Live dict update
+                                if 'choices' in data and len(data['choices']) > 0:
+                                    chunk = data['choices'][0]['delta'].get('content', '')
+                                    full_text += chunk
+                                    # Append cursor for visual streaming feedback
+                                    task_dict[key_to_update] = full_text + " ▌"  
                             except:
                                 pass
+                task_dict[key_to_update] = full_text  # Remove cursor when done
                 return full_text
             elif response.status_code == 429:
+                task_dict[key_to_update] = "⏳ Rate limited. Retrying..."
                 time.sleep(2**i + random.random())
                 continue
             else:
-                return f"Error: {response.status_code} - {response.text}"
+                err = f"API Error: {response.status_code} - {response.text}"
+                task_dict[key_to_update] = err
+                return err
         except Exception as e:
+            task_dict[key_to_update] = f"⏳ Connection issue. Retrying... ({str(e)})"
             time.sleep(2**i + random.random())
-            if i == 4: return f"Connection Error: {str(e)}"
+            if i == 4: 
+                err = f"Connection Error: {str(e)}"
+                task_dict[key_to_update] = err
+                return err
     
-    return "Rate limit exceeded or API error."
+    err = "Rate limit exceeded or API error after retries."
+    task_dict[key_to_update] = err
+    return err
 
 def run_debate_bg(task_id, topic, ctx, model_id, or_key, db_client):
     """Background thread function generating the debate while pushing streaming updates."""
@@ -118,12 +133,15 @@ def run_debate_bg(task_id, topic, ctx, model_id, or_key, db_client):
     try:
         task["status"] = "Proponent is forming arguments..."
         pro = stream_openrouter(or_key, model_id, "Proponent", f"Argue FOR: {topic}", ctx, task, "pro")
+        task["pro"] = pro # Ensure finalized text is set
         
         task["status"] = "Opponent is formulating rebuttal..."
         con = stream_openrouter(or_key, model_id, "Opponent", f"Rebut: {pro} and argue AGAINST: {topic}", ctx, task, "con")
+        task["con"] = con
         
         task["status"] = "Judge is evaluating..."
         judge = stream_openrouter(or_key, model_id, "Neutral Judge", f"Judge this debate objectively based on logical strength and usage of provided sources: \nPRO: {pro}\nCON: {con}", ctx, task, "judge")
+        task["judge"] = judge
         
         debate_data = {
             "id": task_id,
@@ -220,19 +238,25 @@ with tab1:
             for tid, task in list(st.session_state.tasks.items()):
                 if task["status"] not in ["Completed", "Error"]:
                     elapsed = (datetime.now() - task["start_time"]).total_seconds()
-                    st.markdown(f'<div class="task-box">⏳ <b>{task["topic"]}</b> - {task["status"]} <i>({int(elapsed)}s)</i></div>', unsafe_allow_html=True)
                     
-                    if task.get("pro") or task.get("con") or task.get("judge"):
-                        with st.expander("👀 View Live Progress (Auto-updating)", expanded=True):
-                            if task.get("pro"):
-                                st.markdown("**🔵 Proponent:**")
+                    with st.expander(f"⏳ {task['topic']} - {task['status']} ({int(elapsed)}s)", expanded=True):
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.subheader("🔵 Proponent")
+                            if "pro" in task:
                                 st.write(task["pro"])
-                            if task.get("con"):
-                                st.markdown("**🔴 Opponent:**")
+                            else:
+                                st.caption("Waiting to begin...")
+                                
+                        with col2:
+                            st.subheader("🔴 Opponent")
+                            if "con" in task:
                                 st.write(task["con"])
-                            if task.get("judge"):
-                                st.markdown("**⚖️ Judge:**")
-                                st.write(task["judge"])
+                            else:
+                                st.caption("Waiting for Proponent...")
+                                
+                        if "judge" in task:
+                            st.markdown(f'<div class="verdict-box"><h3>⚖️ Judge Verdict</h3>{task["judge"]}</div>', unsafe_allow_html=True)
                                 
                 elif task["status"].startswith("Error"):
                     st.error(f"❌ **{task['topic']}** - {task['status']}")
