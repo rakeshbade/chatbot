@@ -7,9 +7,11 @@ import time
 import random
 import uuid
 import json
+import threading
 from datetime import datetime
 from google.cloud import firestore
 from google.oauth2 import service_account
+from streamlit.runtime.scriptrunner import add_script_run_ctx
 
 # --- Configuration & UI ---
 st.set_page_config(page_title="AI Elocution Arena", page_icon="⚖️", layout="wide")
@@ -20,8 +22,17 @@ st.markdown("""
     .stTabs [data-baseweb="tab"] { height: 50px; font-weight: 600; }
     .debate-card { padding: 20px; border-radius: 10px; background: white; border: 1px solid #ddd; margin-bottom: 15px; }
     .verdict-box { background-color: #f3e5f5; padding: 15px; border-radius: 8px; border-left: 5px solid #9c27b0; }
+    .task-box { background-color: #e3f2fd; padding: 10px 15px; border-radius: 8px; border-left: 5px solid #2196f3; margin-bottom: 10px; }
     </style>
     """, unsafe_allow_html=True)
+
+# --- Session State Initialization ---
+if "tasks" not in st.session_state:
+    st.session_state.tasks = {}
+if "completed_debates" not in st.session_state:
+    st.session_state.completed_debates = []
+if "fetch_result" not in st.session_state:
+    st.session_state.fetch_result = None
 
 # --- 1. Database Setup (Freemium Firestore) ---
 def get_db_client():
@@ -90,6 +101,42 @@ def call_openrouter(api_key, model_id, role, task, context):
     
     return "Rate limit exceeded or API error."
 
+def run_debate_bg(task_id, topic, ctx, model_id, or_key, db_client):
+    """Background thread function to generate the debate without blocking UI."""
+    try:
+        st.session_state.tasks[task_id]["status"] = "Proponent is forming arguments..."
+        pro = call_openrouter(or_key, model_id, "Proponent", f"Argue FOR: {topic}", ctx)
+        
+        st.session_state.tasks[task_id]["status"] = "Opponent is formulating rebuttal..."
+        con = call_openrouter(or_key, model_id, "Opponent", f"Rebut: {pro} and argue AGAINST: {topic}", ctx)
+        
+        st.session_state.tasks[task_id]["status"] = "Judge is evaluating..."
+        judge = call_openrouter(or_key, model_id, "Neutral Judge", f"Judge this debate objectively based on logical strength and usage of provided sources: \nPRO: {pro}\nCON: {con}", ctx)
+        
+        debate_data = {
+            "id": task_id,
+            "timestamp": datetime.now(),
+            "topic": topic,
+            "model": model_id,
+            "pro": pro,
+            "con": con,
+            "judge": judge
+        }
+        
+        # Insert at the beginning so newest is on top
+        st.session_state.completed_debates.insert(0, debate_data)
+        st.session_state.tasks[task_id]["status"] = "Completed"
+        
+        # Save to Firestore if available
+        if db_client:
+            try:
+                db_client.collection("debates").document(task_id).set(debate_data)
+            except Exception as e:
+                print(f"Firestore save error: {e}")
+                
+    except Exception as e:
+        st.session_state.tasks[task_id]["status"] = f"Error: {e}"
+
 # --- 3. Main App Layout ---
 tab1, tab2 = st.tabs(["🎮 Competition Arena", "📚 Debate Archive"])
 
@@ -110,7 +157,6 @@ with tab1:
                 or_key = st.secrets["openrouter_key"]
                 model_id = st.secrets["openrouter_model"]
         except Exception:
-            # st.secrets raises an error if the file is missing entirely
             has_secrets = False
         
         if not has_secrets:
@@ -130,64 +176,65 @@ with tab1:
         files = st.file_uploader("Upload Sources", accept_multiple_files=True)
         urls = st.text_area("Source Links")
         
-        if st.button("🏁 Start Debate Session", disabled=not has_secrets):
-            if not topic:
-                st.error("Debate Topic is required.")
-            else:
-                st.session_state.start_time = datetime.now()
+        # Disable if required fields are missing
+        can_start = bool(topic.strip()) and has_secrets
+
+        if st.button("🏁 Start Debate Session", disabled=not can_start):
+            # Extract text synchronously first (files might close after rerun)
+            with st.spinner("Extracting sources..."):
+                ctx = extract_text(files, urls)
                 
-                with st.spinner(f"Agents are debating using {model_id}..."):
-                    ctx = extract_text(files, urls)
-                    
-                    # Agent Sequence
-                    pro = call_openrouter(or_key, model_id, "Proponent", f"Argue FOR: {topic}", ctx)
-                    time.sleep(0.5)
-                    con = call_openrouter(or_key, model_id, "Opponent", f"Rebut: {pro} and argue AGAINST: {topic}", ctx)
-                    time.sleep(0.5)
-                    judge = call_openrouter(or_key, model_id, "Neutral Judge", f"Judge this debate objectively based on logical strength and usage of provided sources: \nPRO: {pro}\nCON: {con}", ctx)
-                    
-                    debate_data = {
-                        "id": str(uuid.uuid4())[:8],
-                        "timestamp": datetime.now(),
-                        "topic": topic,
-                        "model": model_id,
-                        "pro": pro,
-                        "con": con,
-                        "judge": judge
-                    }
-                    
-                    st.session_state.current_debate = debate_data
-                    
-                    # Save to Firestore if available
-                    if db:
-                        try:
-                            db.collection("debates").document(debate_data["id"]).set(debate_data)
-                            st.success(f"Saved to cloud! ID: {debate_data['id']}")
-                        except Exception as e:
-                            st.error(f"Firestore Error: {e}")
-                    else:
-                        st.info("Cloud storage not configured. View current session only.")
+            task_id = str(uuid.uuid4())[:8]
+            st.session_state.tasks[task_id] = {
+                "topic": topic,
+                "status": "Starting agents...",
+                "start_time": datetime.now()
+            }
+            
+            # Start background thread
+            thread = threading.Thread(
+                target=run_debate_bg, 
+                args=(task_id, topic, ctx, model_id, or_key, db)
+            )
+            add_script_run_ctx(thread)
+            thread.start()
+            
+            st.rerun() # Refresh page immediately to show new task in queue
 
     with col_disp:
-        if "current_debate" in st.session_state:
-            d = st.session_state.current_debate
-            st.header(f"Topic: {d['topic']}")
-            st.caption(f"Model: {d.get('model', 'Unknown')}")
-            
-            # Timer Display (20m visual countdown)
-            elapsed = datetime.now() - st.session_state.start_time
-            remaining = max(0, 1200 - elapsed.total_seconds())
-            st.progress(remaining / 1200, text=f"Session Remaining: {int(remaining//60)}m {int(remaining%60)}s")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.subheader("🔵 Proponent")
-                st.write(d["pro"])
-            with col2:
-                st.subheader("🔴 Opponent")
-                st.write(d["con"])
+        header_col, btn_col = st.columns([3, 1])
+        with header_col:
+            st.header("Live & Recent Debates")
+        with btn_col:
+            # Manual refresh for threaded updates
+            if st.button("🔄 Refresh Status"):
+                st.rerun()
                 
-            st.markdown(f'<div class="verdict-box"><h3>⚖️ Judge Verdict</h3>{d["judge"]}</div>', unsafe_allow_html=True)
+        # Display Active/Running Tasks
+        for tid, task in list(st.session_state.tasks.items()):
+            if task["status"] not in ["Completed", "Error"]:
+                elapsed = (datetime.now() - task["start_time"]).total_seconds()
+                st.markdown(f'<div class="task-box">⏳ <b>{task["topic"]}</b> - {task["status"]} <i>({int(elapsed)}s)</i></div>', unsafe_allow_html=True)
+            elif task["status"].startswith("Error"):
+                st.error(f"❌ **{task['topic']}** - {task['status']}")
+                
+        if len(st.session_state.completed_debates) == 0 and len(st.session_state.tasks) == 0:
+            st.info("No debates yet. Start a session from the left panel!")
+
+        # Display Completed Debates
+        for d in st.session_state.completed_debates:
+            with st.expander(f"✅ {d['topic']} (ID: {d['id']})", expanded=True):
+                st.caption(f"Model: {d.get('model', 'Unknown')} | Time: {d['timestamp'].strftime('%H:%M:%S')}")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.subheader("🔵 Proponent")
+                    st.write(d["pro"])
+                with col2:
+                    st.subheader("🔴 Opponent")
+                    st.write(d["con"])
+                    
+                st.markdown(f'<div class="verdict-box"><h3>⚖️ Judge Verdict</h3>{d["judge"]}</div>', unsafe_allow_html=True)
 
 with tab2:
     st.header("Cloud Archives")
@@ -195,20 +242,28 @@ with tab2:
         st.warning("Connect a Firestore service account in Streamlit Secrets to enable permanent storage.")
     else:
         search_id = st.text_input("Search by Debate ID")
-        if st.button("Fetch Debate"):
-            doc = db.collection("debates").document(search_id).get()
-            if doc.exists:
-                res = doc.to_dict()
-                st.write(f"### Topic: {res['topic']}")
-                st.caption(f"Model used: {res.get('model', 'N/A')}")
-                st.write("**Verdict:**")
-                st.write(res['judge'])
-                
-                with st.expander("Show Full Debate History"):
-                    st.write("**Pro:**", res['pro'])
-                    st.write("**Con:**", res['con'])
-            else:
-                st.error("Debate not found.")
+        
+        # Disable fetch button when no ID is provided
+        if st.button("Fetch Debate", disabled=not search_id.strip()):
+            with st.spinner("Fetching from database..."):
+                doc = db.collection("debates").document(search_id).get()
+                if doc.exists:
+                    st.session_state.fetch_result = doc.to_dict()
+                else:
+                    st.session_state.fetch_result = "Not Found"
+                    
+        if st.session_state.fetch_result == "Not Found":
+            st.error("Debate not found.")
+        elif st.session_state.fetch_result:
+            res = st.session_state.fetch_result
+            st.write(f"### Topic: {res['topic']}")
+            st.caption(f"Model used: {res.get('model', 'N/A')}")
+            st.write("**Verdict:**")
+            st.write(res['judge'])
+            
+            with st.expander("Show Full Debate History"):
+                st.write("**Pro:**", res['pro'])
+                st.write("**Con:**", res['con'])
         
         st.divider()
         st.subheader("Recent Debates")
