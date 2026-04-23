@@ -37,7 +37,6 @@ if "fetch_result" not in st.session_state:
 # --- 1. Database Setup (Freemium Firestore) ---
 def get_db_client():
     try:
-        # Safer access to secrets to prevent crash if secrets.toml is missing
         if hasattr(st, "secrets") and "firestore" in st.secrets:
             creds = service_account.Credentials.from_service_account_info(st.secrets["firestore"])
             return firestore.Client(credentials=creds)
@@ -65,8 +64,8 @@ def extract_text(files, urls):
             except: context += f"\n[LINK ERROR: {url}]\n"
     return context
 
-def call_openrouter(api_key, model_id, role, task, context):
-    """Calls OpenRouter API with exponential backoff."""
+def stream_openrouter(api_key, model_id, role, task_prompt, context, task_dict, key_to_update):
+    """Calls OpenRouter API with streaming to update the UI token-by-token."""
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -75,21 +74,33 @@ def call_openrouter(api_key, model_id, role, task, context):
         "Content-Type": "application/json"
     }
     
-    prompt = f"ROLE: {role}\nSOURCE-ONLY MODE: Use only the text provided in SOURCES. If specific evidence is missing, state 'Evidence not found.'\n\nSOURCES:\n{context}\n\nTASK: {task}"
+    prompt = f"ROLE: {role}\nSOURCE-ONLY MODE: Use only the text provided in SOURCES. If specific evidence is missing, state 'Evidence not found.'\n\nSOURCES:\n{context}\n\nTASK: {task_prompt}"
     
     payload = {
         "model": model_id,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ]
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True
     }
+    
+    task_dict[key_to_update] = ""
+    full_text = ""
 
     for i in range(5): 
         try:
-            response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+            response = requests.post(url, headers=headers, json=payload, stream=True, timeout=60)
             if response.status_code == 200:
-                result = response.json()
-                return result['choices'][0]['message']['content']
+                for line in response.iter_lines():
+                    if line:
+                        line = line.decode('utf-8')
+                        if line.startswith("data: ") and line != "data: [DONE]":
+                            try:
+                                data = json.loads(line[6:])
+                                chunk = data['choices'][0]['delta'].get('content', '')
+                                full_text += chunk
+                                task_dict[key_to_update] = full_text  # Live dict update
+                            except:
+                                pass
+                return full_text
             elif response.status_code == 429:
                 time.sleep(2**i + random.random())
                 continue
@@ -102,18 +113,17 @@ def call_openrouter(api_key, model_id, role, task, context):
     return "Rate limit exceeded or API error."
 
 def run_debate_bg(task_id, topic, ctx, model_id, or_key, db_client):
-    """Background thread function to generate the debate without blocking UI."""
+    """Background thread function generating the debate while pushing streaming updates."""
+    task = st.session_state.tasks[task_id]
     try:
-        st.session_state.tasks[task_id]["status"] = "Proponent is forming arguments..."
-        pro = call_openrouter(or_key, model_id, "Proponent", f"Argue FOR: {topic}", ctx)
-        st.session_state.tasks[task_id]["pro"] = pro  # Track live progress
+        task["status"] = "Proponent is forming arguments..."
+        pro = stream_openrouter(or_key, model_id, "Proponent", f"Argue FOR: {topic}", ctx, task, "pro")
         
-        st.session_state.tasks[task_id]["status"] = "Opponent is formulating rebuttal..."
-        con = call_openrouter(or_key, model_id, "Opponent", f"Rebut: {pro} and argue AGAINST: {topic}", ctx)
-        st.session_state.tasks[task_id]["con"] = con  # Track live progress
+        task["status"] = "Opponent is formulating rebuttal..."
+        con = stream_openrouter(or_key, model_id, "Opponent", f"Rebut: {pro} and argue AGAINST: {topic}", ctx, task, "con")
         
-        st.session_state.tasks[task_id]["status"] = "Judge is evaluating..."
-        judge = call_openrouter(or_key, model_id, "Neutral Judge", f"Judge this debate objectively based on logical strength and usage of provided sources: \nPRO: {pro}\nCON: {con}", ctx)
+        task["status"] = "Judge is evaluating..."
+        judge = stream_openrouter(or_key, model_id, "Neutral Judge", f"Judge this debate objectively based on logical strength and usage of provided sources: \nPRO: {pro}\nCON: {con}", ctx, task, "judge")
         
         debate_data = {
             "id": task_id,
@@ -125,11 +135,9 @@ def run_debate_bg(task_id, topic, ctx, model_id, or_key, db_client):
             "judge": judge
         }
         
-        # Insert at the beginning so newest is on top
         st.session_state.completed_debates.insert(0, debate_data)
-        st.session_state.tasks[task_id]["status"] = "Completed"
+        task["status"] = "Completed"
         
-        # Save to Firestore if available
         if db_client:
             try:
                 db_client.collection("debates").document(task_id).set(debate_data)
@@ -137,7 +145,7 @@ def run_debate_bg(task_id, topic, ctx, model_id, or_key, db_client):
                 print(f"Firestore save error: {e}")
                 
     except Exception as e:
-        st.session_state.tasks[task_id]["status"] = f"Error: {e}"
+        task["status"] = f"Error: {e}"
 
 # --- 3. Main App Layout ---
 tab1, tab2 = st.tabs(["🎮 Competition Arena", "📚 Debate Archive"])
@@ -148,7 +156,6 @@ with tab1:
     with col_ctrl:
         st.subheader("Setup")
         
-        # Robust secrets check
         has_secrets = False
         or_key = None
         model_id = None
@@ -178,11 +185,9 @@ with tab1:
         files = st.file_uploader("Upload Sources", accept_multiple_files=True)
         urls = st.text_area("Source Links")
         
-        # Disable if required fields are missing
         can_start = bool(topic.strip()) and has_secrets
 
         if st.button("🏁 Start Debate Session", disabled=not can_start):
-            # Extract text synchronously first (files might close after rerun)
             with st.spinner("Extracting sources..."):
                 ctx = extract_text(files, urls)
                 
@@ -193,7 +198,6 @@ with tab1:
                 "start_time": datetime.now()
             }
             
-            # Start background thread
             thread = threading.Thread(
                 target=run_debate_bg, 
                 args=(task_id, topic, ctx, model_id, or_key, db)
@@ -201,40 +205,54 @@ with tab1:
             add_script_run_ctx(thread)
             thread.start()
             
-            st.rerun() # Refresh page immediately to show new task in queue
+            st.rerun() 
 
     with col_disp:
-        header_col, btn_col = st.columns([3, 1])
-        with header_col:
-            st.header("Live & Recent Debates")
-        with btn_col:
-            # Manual refresh for threaded updates
-            if st.button("🔄 Refresh Status"):
-                st.rerun()
-                
-        # Display Active/Running Tasks
-        for tid, task in list(st.session_state.tasks.items()):
-            if task["status"] not in ["Completed", "Error"]:
-                elapsed = (datetime.now() - task["start_time"]).total_seconds()
-                st.markdown(f'<div class="task-box">⏳ <b>{task["topic"]}</b> - {task["status"]} <i>({int(elapsed)}s)</i></div>', unsafe_allow_html=True)
-                
-                # Show live intermediate progress
-                if "pro" in task or "con" in task:
-                    with st.expander("👀 View Live Progress", expanded=True):
-                        if "pro" in task:
-                            st.markdown("**🔵 Proponent:**")
-                            st.write(task["pro"])
-                        if "con" in task:
-                            st.markdown("**🔴 Opponent:**")
-                            st.write(task["con"])
-                            
-            elif task["status"].startswith("Error"):
-                st.error(f"❌ **{task['topic']}** - {task['status']}")
-                
-        if len(st.session_state.completed_debates) == 0 and len(st.session_state.tasks) == 0:
-            st.info("No debates yet. Start a session from the left panel!")
+        # Define live render function
+        def render_live_debates():
+            header_col, btn_col = st.columns([3, 1])
+            with header_col:
+                st.header("Live & Recent Debates")
+            with btn_col:
+                if st.button("🔄 Refresh Status"):
+                    st.rerun()
+                    
+            for tid, task in list(st.session_state.tasks.items()):
+                if task["status"] not in ["Completed", "Error"]:
+                    elapsed = (datetime.now() - task["start_time"]).total_seconds()
+                    st.markdown(f'<div class="task-box">⏳ <b>{task["topic"]}</b> - {task["status"]} <i>({int(elapsed)}s)</i></div>', unsafe_allow_html=True)
+                    
+                    if task.get("pro") or task.get("con") or task.get("judge"):
+                        with st.expander("👀 View Live Progress (Auto-updating)", expanded=True):
+                            if task.get("pro"):
+                                st.markdown("**🔵 Proponent:**")
+                                st.write(task["pro"])
+                            if task.get("con"):
+                                st.markdown("**🔴 Opponent:**")
+                                st.write(task["con"])
+                            if task.get("judge"):
+                                st.markdown("**⚖️ Judge:**")
+                                st.write(task["judge"])
+                                
+                elif task["status"].startswith("Error"):
+                    st.error(f"❌ **{task['topic']}** - {task['status']}")
+                    
+            if len(st.session_state.completed_debates) == 0 and len(st.session_state.tasks) == 0:
+                st.info("No debates yet. Start a session from the left panel!")
 
-        # Display Completed Debates
+        # Use Streamlit fragments to auto-refresh the right panel without interrupting typing on the left
+        has_active_tasks = any(t["status"] not in ["Completed", "Error"] for t in st.session_state.tasks.values())
+        
+        if hasattr(st, "fragment") and has_active_tasks:
+            @st.fragment(run_every=2)
+            def live_auto_refresh_wrapper():
+                render_live_debates()
+                
+            live_auto_refresh_wrapper()
+        else:
+            render_live_debates()
+
+        # Display Completed Debates Outside the Live Render
         for d in st.session_state.completed_debates:
             with st.expander(f"✅ {d['topic']} (ID: {d['id']})", expanded=True):
                 st.caption(f"Model: {d.get('model', 'Unknown')} | Time: {d['timestamp'].strftime('%H:%M:%S')}")
@@ -256,7 +274,6 @@ with tab2:
     else:
         search_id = st.text_input("Search by Debate ID")
         
-        # Disable fetch button when no ID is provided
         if st.button("Fetch Debate", disabled=not search_id.strip()):
             with st.spinner("Fetching from database..."):
                 doc = db.collection("debates").document(search_id).get()
