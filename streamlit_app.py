@@ -106,9 +106,11 @@ def run_debate_bg(task_id, topic, ctx, model_id, or_key, db_client):
     try:
         st.session_state.tasks[task_id]["status"] = "Proponent is forming arguments..."
         pro = call_openrouter(or_key, model_id, "Proponent", f"Argue FOR: {topic}", ctx)
+        st.session_state.tasks[task_id]["pro"] = pro  # Track live progress
         
         st.session_state.tasks[task_id]["status"] = "Opponent is formulating rebuttal..."
         con = call_openrouter(or_key, model_id, "Opponent", f"Rebut: {pro} and argue AGAINST: {topic}", ctx)
+        st.session_state.tasks[task_id]["con"] = con  # Track live progress
         
         st.session_state.tasks[task_id]["status"] = "Judge is evaluating..."
         judge = call_openrouter(or_key, model_id, "Neutral Judge", f"Judge this debate objectively based on logical strength and usage of provided sources: \nPRO: {pro}\nCON: {con}", ctx)
@@ -215,6 +217,17 @@ with tab1:
             if task["status"] not in ["Completed", "Error"]:
                 elapsed = (datetime.now() - task["start_time"]).total_seconds()
                 st.markdown(f'<div class="task-box">⏳ <b>{task["topic"]}</b> - {task["status"]} <i>({int(elapsed)}s)</i></div>', unsafe_allow_html=True)
+                
+                # Show live intermediate progress
+                if "pro" in task or "con" in task:
+                    with st.expander("👀 View Live Progress", expanded=True):
+                        if "pro" in task:
+                            st.markdown("**🔵 Proponent:**")
+                            st.write(task["pro"])
+                        if "con" in task:
+                            st.markdown("**🔴 Opponent:**")
+                            st.write(task["con"])
+                            
             elif task["status"].startswith("Error"):
                 st.error(f"❌ **{task['topic']}** - {task['status']}")
                 
