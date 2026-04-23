@@ -8,6 +8,7 @@ import random
 import uuid
 import json
 import threading
+import re
 from datetime import datetime
 from google.cloud import firestore
 from google.oauth2 import service_account
@@ -21,8 +22,9 @@ st.markdown("""
     .stTabs [data-baseweb="tab-list"] { gap: 24px; }
     .stTabs [data-baseweb="tab"] { height: 50px; font-weight: 600; }
     .debate-card { padding: 20px; border-radius: 10px; background: white; border: 1px solid #ddd; margin-bottom: 15px; }
-    .verdict-box { background-color: #f3e5f5; padding: 15px; border-radius: 8px; border-left: 5px solid #9c27b0; }
+    .verdict-box { background-color: #f3e5f5; padding: 15px; border-radius: 8px; border-left: 5px solid #9c27b0; margin-top: 20px;}
     .task-box { background-color: #e3f2fd; padding: 10px 15px; border-radius: 8px; border-left: 5px solid #2196f3; margin-bottom: 10px; }
+    .turn-box { padding: 10px 0; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -64,8 +66,8 @@ def extract_text(files, urls):
             except: context += f"\n[LINK ERROR: {url}]\n"
     return context
 
-def stream_openrouter(api_key, model_id, role, task_prompt, context, task_dict, key_to_update):
-    """Calls OpenRouter API with streaming to update the UI token-by-token."""
+def stream_openrouter(api_key, model_id, role, task_prompt, context, target_dict):
+    """Calls OpenRouter API with streaming and reasoning capture."""
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -74,24 +76,28 @@ def stream_openrouter(api_key, model_id, role, task_prompt, context, task_dict, 
         "Content-Type": "application/json"
     }
     
-    prompt = f"ROLE: {role}\nSOURCE-ONLY MODE: Use only the text provided in SOURCES. If specific evidence is missing, state 'Evidence not found.'\n\nSOURCES:\n{context}\n\nTASK: {task_prompt}"
+    if role == "Neutral Judge":
+        prompt = f"ROLE: {role}\nINSTRUCTION: Before answering, ALWAYS wrap your detailed evaluation and thinking process in <think>...</think> tags.\n\nTASK: {task_prompt}\n\nYou must evaluate the full debate transcript against the provided reference SOURCES.\n\nREFERENCE SOURCES:\n{context}"
+    else:
+        prompt = f"ROLE: {role}\nINSTRUCTION: Before answering, ALWAYS wrap your detailed thinking process and strategy in <think>...</think> tags. Then provide your official argument.\nSOURCE-ONLY MODE: Use only the text provided in SOURCES.\n\nSOURCES:\n{context}\n\nTASK: {task_prompt}"
     
     payload = {
         "model": model_id,
         "messages": [{"role": "user", "content": prompt}],
-        "stream": True
+        "stream": True,
+        "include_reasoning": True  # Enable native reasoning for models that support it
     }
     
-    # Pre-fill so UI immediately knows we are doing something
-    task_dict[key_to_update] = "⏳ Reading sources & thinking..."
+    target_dict["text"] = "⏳ Reading sources & thinking..."
+    target_dict["thinking"] = ""
     full_text = ""
+    full_thinking = ""
 
     for i in range(5): 
         try:
-            # Increased timeout for large contexts (TTFT can be long)
             response = requests.post(url, headers=headers, json=payload, stream=True, timeout=120)
             if response.status_code == 200:
-                task_dict[key_to_update] = ""  # Clear the thinking message
+                target_dict["text"] = ""  
                 for line in response.iter_lines():
                     if line:
                         line = line.decode('utf-8')
@@ -99,58 +105,95 @@ def stream_openrouter(api_key, model_id, role, task_prompt, context, task_dict, 
                             try:
                                 data = json.loads(line[6:])
                                 if 'choices' in data and len(data['choices']) > 0:
-                                    chunk = data['choices'][0]['delta'].get('content', '')
-                                    full_text += chunk
-                                    # Append cursor for visual streaming feedback
-                                    task_dict[key_to_update] = full_text + " ▌"  
+                                    delta = data['choices'][0]['delta']
+                                    
+                                    # Capture Native API Reasoning (e.g. DeepSeek R1)
+                                    if 'reasoning' in delta and delta['reasoning']:
+                                        full_thinking += delta['reasoning']
+                                        target_dict["thinking"] = full_thinking
+                                        
+                                    # Capture Standard Content
+                                    if 'content' in delta and delta['content'] is not None:
+                                        full_text += delta['content']
+                                        target_dict["text"] = full_text + " ▌"  
                             except:
                                 pass
-                task_dict[key_to_update] = full_text  # Remove cursor when done
+                target_dict["text"] = full_text  # Remove cursor
                 return full_text
             elif response.status_code == 429:
-                task_dict[key_to_update] = "⏳ Rate limited. Retrying..."
+                target_dict["text"] = "⏳ Rate limited. Retrying..."
                 time.sleep(2**i + random.random())
                 continue
             else:
                 err = f"API Error: {response.status_code} - {response.text}"
-                task_dict[key_to_update] = err
+                target_dict["text"] = err
                 return err
         except Exception as e:
-            task_dict[key_to_update] = f"⏳ Connection issue. Retrying... ({str(e)})"
+            target_dict["text"] = f"⏳ Connection issue. Retrying... ({str(e)})"
             time.sleep(2**i + random.random())
             if i == 4: 
                 err = f"Connection Error: {str(e)}"
-                task_dict[key_to_update] = err
+                target_dict["text"] = err
                 return err
     
     err = "Rate limit exceeded or API error after retries."
-    task_dict[key_to_update] = err
+    target_dict["text"] = err
     return err
 
 def run_debate_bg(task_id, topic, ctx, model_id, or_key, db_client):
-    """Background thread function generating the debate while pushing streaming updates."""
+    """Background thread running a 10-turn debate and pushing streaming updates."""
     task = st.session_state.tasks[task_id]
+    task["turns"] = []
+    
     try:
-        task["status"] = "Proponent is forming arguments..."
-        pro = stream_openrouter(or_key, model_id, "Proponent", f"Argue FOR: {topic}", ctx, task, "pro")
-        task["pro"] = pro # Ensure finalized text is set
+        # --- 10 Turn Conversation Loop ---
+        for i in range(10):
+            role = "Proponent" if i % 2 == 0 else "Opponent"
+            task["status"] = f"Turn {i+1}/10: {role} is arguing..."
+            
+            turn_dict = {"role": role, "text": "", "thinking": ""}
+            task["turns"].append(turn_dict)
+            
+            # Build clean history (stripping out previous <think> tags so models don't read opponent's minds)
+            clean_history = []
+            for t in task["turns"][:-1]:
+                clean_text = re.sub(r'<think>.*?(?:</think>|$)', '', t['text'], flags=re.DOTALL).strip()
+                clean_history.append(f"{t['role']}: {clean_text}")
+            history_text = "\n\n".join(clean_history)
+            
+            if i == 0:
+                prompt = f"Make your opening argument FOR: {topic}"
+            elif i == 1:
+                prompt = f"Make your opening argument AGAINST: {topic}. Directly address the Proponent's points.\n\nDEBATE HISTORY:\n{history_text}"
+            else:
+                prompt = f"Provide your counter-argument. Address the opponent's latest points and strengthen your case.\n\nDEBATE HISTORY:\n{history_text}"
+                
+            stream_openrouter(or_key, model_id, role, prompt, ctx, turn_dict)
         
-        task["status"] = "Opponent is formulating rebuttal..."
-        con = stream_openrouter(or_key, model_id, "Opponent", f"Rebut: {pro} and argue AGAINST: {topic}", ctx, task, "con")
-        task["con"] = con
+        # --- Judge Evaluation ---
+        task["status"] = "Judge is evaluating the full transcript..."
         
-        task["status"] = "Judge is evaluating..."
-        judge = stream_openrouter(or_key, model_id, "Neutral Judge", f"Judge this debate objectively based on logical strength and usage of provided sources: \nPRO: {pro}\nCON: {con}", ctx, task, "judge")
-        task["judge"] = judge
+        # Pass the full clean history to the judge
+        clean_history = []
+        for i, t in enumerate(task["turns"]):
+            clean_text = re.sub(r'<think>.*?(?:</think>|$)', '', t['text'], flags=re.DOTALL).strip()
+            clean_history.append(f"TURN {i+1} - {t['role']}: {clean_text}")
+        full_transcript = "\n\n".join(clean_history)
         
+        judge_dict = {"role": "Neutral Judge", "text": "", "thinking": ""}
+        task["judge_data"] = judge_dict
+        
+        judge_prompt = f"Judge this 10-turn debate objectively based on logical strength, effective rebuttals, and accuracy against provided sources:\n\n{full_transcript}"
+        stream_openrouter(or_key, model_id, "Neutral Judge", judge_prompt, ctx, judge_dict)
+        
+        # --- Save ---
         debate_data = {
             "id": task_id,
             "timestamp": datetime.now(),
             "topic": topic,
             "model": model_id,
-            "pro": pro,
-            "con": con,
-            "judge": judge
+            "turns": task["turns"],
+            "judge_data": task["judge_data"]
         }
         
         st.session_state.completed_debates.insert(0, debate_data)
@@ -164,6 +207,63 @@ def run_debate_bg(task_id, topic, ctx, model_id, or_key, db_client):
                 
     except Exception as e:
         task["status"] = f"Error: {e}"
+
+# --- Rendering Helper ---
+def render_turn(turn, is_live=False):
+    """Renders a single agent's turn, separating thinking from the final response."""
+    # 1. Native API Reasoning
+    if turn.get("thinking"):
+        with st.expander("🧠 Internal Thinking Process", expanded=is_live):
+            st.markdown(turn["thinking"])
+            
+    text = turn.get("text", "")
+    if text == "⏳ Reading sources & thinking...":
+        st.caption(text)
+        return
+        
+    # 2. Extract inline <think> tags (if model embeds it in content)
+    think_match = re.search(r'<think>(.*?)(?:</think>|$)', text, re.DOTALL | re.IGNORECASE)
+    if think_match:
+        think_content = think_match.group(1).strip()
+        if think_content:
+            with st.expander("🧠 Internal Thinking Process", expanded=is_live):
+                st.markdown(think_content)
+                
+        # Remove the think block from final text
+        text_without_think = re.sub(r'<think>.*?(?:</think>|$)', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+        if text_without_think:
+            st.markdown(text_without_think)
+    else:
+        st.markdown(text)
+
+def render_debate(data, is_live_task=False):
+    """Renders the full debate transcript, supporting legacy and new structures."""
+    if "turns" in data:
+        for i, turn in enumerate(data["turns"]):
+            role_icon = "🔵" if turn["role"] == "Proponent" else "🔴"
+            st.markdown(f"<div class='turn-box'><h4>{role_icon} Turn {i+1}: {turn['role']}</h4></div>", unsafe_allow_html=True)
+            
+            # Auto-expand the thinking process only if it's the actively generating turn
+            is_active_turn = is_live_task and i == len(data["turns"]) - 1 and "judge_data" not in data
+            render_turn(turn, is_live=is_active_turn)
+            st.divider()
+            
+        if "judge_data" in data and data["judge_data"].get("text"):
+            st.markdown('<div class="verdict-box"><h3>⚖️ Judge Verdict</h3>', unsafe_allow_html=True)
+            render_turn(data["judge_data"], is_live=is_live_task)
+            st.markdown('</div>', unsafe_allow_html=True)
+            
+    # Fallback for old debates stored in DB before the 10-turn update
+    elif "pro" in data:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("🔵 Proponent")
+            st.write(data["pro"])
+        with col2:
+            st.subheader("🔴 Opponent")
+            st.write(data["con"])
+        if data.get("judge"):
+            st.markdown(f'<div class="verdict-box"><h3>⚖️ Judge Verdict</h3>{data["judge"]}</div>', unsafe_allow_html=True)
 
 # --- 3. Main App Layout ---
 tab1, tab2 = st.tabs(["🎮 Competition Arena", "📚 Debate Archive"])
@@ -205,7 +305,7 @@ with tab1:
         
         can_start = bool(topic.strip()) and has_secrets
 
-        if st.button("🏁 Start Debate Session", disabled=not can_start):
+        if st.button("🏁 Start 10-Turn Debate Session", disabled=not can_start):
             with st.spinner("Extracting sources..."):
                 ctx = extract_text(files, urls)
                 
@@ -226,7 +326,6 @@ with tab1:
             st.rerun() 
 
     with col_disp:
-        # Define live render function
         def render_live_debates():
             header_col, btn_col = st.columns([3, 1])
             with header_col:
@@ -240,23 +339,7 @@ with tab1:
                     elapsed = (datetime.now() - task["start_time"]).total_seconds()
                     
                     with st.expander(f"⏳ {task['topic']} - {task['status']} ({int(elapsed)}s)", expanded=True):
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.subheader("🔵 Proponent")
-                            if "pro" in task:
-                                st.write(task["pro"])
-                            else:
-                                st.caption("Waiting to begin...")
-                                
-                        with col2:
-                            st.subheader("🔴 Opponent")
-                            if "con" in task:
-                                st.write(task["con"])
-                            else:
-                                st.caption("Waiting for Proponent...")
-                                
-                        if "judge" in task:
-                            st.markdown(f'<div class="verdict-box"><h3>⚖️ Judge Verdict</h3>{task["judge"]}</div>', unsafe_allow_html=True)
+                        render_debate(task, is_live_task=True)
                                 
                 elif task["status"].startswith("Error"):
                     st.error(f"❌ **{task['topic']}** - {task['status']}")
@@ -264,7 +347,7 @@ with tab1:
             if len(st.session_state.completed_debates) == 0 and len(st.session_state.tasks) == 0:
                 st.info("No debates yet. Start a session from the left panel!")
 
-        # Use Streamlit fragments to auto-refresh the right panel without interrupting typing on the left
+        # Fragment auto-refresh setup
         has_active_tasks = any(t["status"] not in ["Completed", "Error"] for t in st.session_state.tasks.values())
         
         if hasattr(st, "fragment") and has_active_tasks:
@@ -276,20 +359,10 @@ with tab1:
         else:
             render_live_debates()
 
-        # Display Completed Debates Outside the Live Render
         for d in st.session_state.completed_debates:
             with st.expander(f"✅ {d['topic']} (ID: {d['id']})", expanded=True):
                 st.caption(f"Model: {d.get('model', 'Unknown')} | Time: {d['timestamp'].strftime('%H:%M:%S')}")
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.subheader("🔵 Proponent")
-                    st.write(d["pro"])
-                with col2:
-                    st.subheader("🔴 Opponent")
-                    st.write(d["con"])
-                    
-                st.markdown(f'<div class="verdict-box"><h3>⚖️ Judge Verdict</h3>{d["judge"]}</div>', unsafe_allow_html=True)
+                render_debate(d, is_live_task=False)
 
 with tab2:
     st.header("Cloud Archives")
@@ -312,12 +385,9 @@ with tab2:
             res = st.session_state.fetch_result
             st.write(f"### Topic: {res['topic']}")
             st.caption(f"Model used: {res.get('model', 'N/A')}")
-            st.write("**Verdict:**")
-            st.write(res['judge'])
             
-            with st.expander("Show Full Debate History"):
-                st.write("**Pro:**", res['pro'])
-                st.write("**Con:**", res['con'])
+            with st.expander("Show Full Debate History", expanded=True):
+                render_debate(res, is_live_task=False)
         
         st.divider()
         st.subheader("Recent Debates")
@@ -327,8 +397,12 @@ with tab2:
                 data = doc.to_dict()
                 with st.expander(f"{data['timestamp'].strftime('%Y-%m-%d %H:%M')} - {data['topic']}"):
                     st.write(f"**Model:** {data.get('model', 'N/A')}")
-                    st.write("**Verdict:**")
-                    st.write(data['judge'])
                     st.caption(f"ID: {data['id']}")
+                    if "judge_data" in data and data["judge_data"].get("text"):
+                        st.write("**Verdict:**")
+                        st.write(re.sub(r'<think>.*?</think>', '', data['judge_data']['text'], flags=re.DOTALL).strip())
+                    elif "judge" in data:
+                        st.write("**Verdict:**")
+                        st.write(data['judge'])
         except Exception as e:
             st.error("Could not load recent debates.")
