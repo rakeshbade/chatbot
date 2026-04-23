@@ -1,2 +1,7 @@
 streamlit
-openai
+google-generativeai
+PyPDF2
+requests
+beautifulsoup4
+google-cloud-firestore
+google-auth
