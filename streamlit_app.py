@@ -67,7 +67,7 @@ def extract_text(files, urls):
     return context
 
 def stream_openrouter(api_key, model_id, role, task_prompt, context, target_dict):
-    """Calls OpenRouter API with streaming and reasoning capture."""
+    """Calls OpenRouter API with highly robust streaming, retry, and keep-alive handling."""
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -85,58 +85,99 @@ def stream_openrouter(api_key, model_id, role, task_prompt, context, target_dict
         "model": model_id,
         "messages": [{"role": "user", "content": prompt}],
         "stream": True,
-        "include_reasoning": True  # Enable native reasoning for models that support it
+        "include_reasoning": True 
     }
     
-    target_dict["text"] = "⏳ Reading sources & thinking..."
+    target_dict["text"] = "⏳ Reading sources & connecting..."
     target_dict["thinking"] = ""
-    full_text = ""
-    full_thinking = ""
 
     for i in range(5): 
+        full_text = ""
+        full_thinking = ""
+        
         try:
             response = requests.post(url, headers=headers, json=payload, stream=True, timeout=120)
+            
             if response.status_code == 200:
-                target_dict["text"] = ""  
+                got_first_chunk = False
+                
                 for line in response.iter_lines():
                     if line:
-                        line = line.decode('utf-8')
-                        if line.startswith("data: ") and line != "data: [DONE]":
-                            try:
-                                data = json.loads(line[6:])
-                                if 'choices' in data and len(data['choices']) > 0:
-                                    delta = data['choices'][0]['delta']
+                        line_str = line.decode('utf-8').strip()
+                        
+                        # Handle Keep-Alives used by long-thinking models to prevent drops
+                        if line_str.startswith(":"):
+                            if not got_first_chunk:
+                                target_dict["text"] = "⏳ Model is reading & thinking (keep-alive received)..."
+                            continue
+                            
+                        if line_str == "data: [DONE]":
+                            continue
+
+                        if line_str.startswith("data: "):
+                            line_str = line_str[6:]
+
+                        try:
+                            data = json.loads(line_str)
+                            
+                            if 'error' in data:
+                                raise ValueError(f"API Error: {data['error']}")
+                                
+                            if 'choices' in data and len(data['choices']) > 0:
+                                choice = data['choices'][0]
+                                chunk_text = ""
+                                chunk_think = ""
+                                
+                                # Handle Streaming Delta
+                                if 'delta' in choice:
+                                    chunk_text = choice['delta'].get('content', '') or ''
+                                    chunk_think = choice['delta'].get('reasoning', '') or ''
+                                # Handle Non-Streaming Fallback (If free model ignores stream=True)
+                                elif 'message' in choice:
+                                    chunk_text = choice['message'].get('content', '') or ''
+                                    chunk_think = choice['message'].get('reasoning', '') or ''
+
+                                if chunk_think:
+                                    full_thinking += chunk_think
+                                    target_dict["thinking"] = full_thinking
+                                    got_first_chunk = True
+
+                                if chunk_text:
+                                    full_text += chunk_text
+                                    target_dict["text"] = full_text + " ▌"  
+                                    got_first_chunk = True
                                     
-                                    # Capture Native API Reasoning (e.g. DeepSeek R1)
-                                    if 'reasoning' in delta and delta['reasoning']:
-                                        full_thinking += delta['reasoning']
-                                        target_dict["thinking"] = full_thinking
-                                        
-                                    # Capture Standard Content
-                                    if 'content' in delta and delta['content'] is not None:
-                                        full_text += delta['content']
-                                        target_dict["text"] = full_text + " ▌"  
-                            except:
-                                pass
-                target_dict["text"] = full_text  # Remove cursor
+                                if not got_first_chunk and not target_dict["text"].startswith("⏳"):
+                                     target_dict["text"] = "⏳ Receiving data stream..."
+
+                        except json.JSONDecodeError:
+                            pass
+                            
+                # If API connection succeeded but yielded 0 text/thinking bytes (Free Model Glitch)
+                if not full_text and not full_thinking:
+                    raise ValueError("Empty 0-byte response received from model.")
+                    
+                target_dict["text"] = full_text  # Remove cursor upon completion
                 return full_text
+                
             elif response.status_code == 429:
-                target_dict["text"] = "⏳ Rate limited. Retrying..."
+                target_dict["text"] = f"⏳ Rate limited. Retrying {i+1}/5..."
                 time.sleep(2**i + random.random())
                 continue
             else:
                 err = f"API Error: {response.status_code} - {response.text}"
                 target_dict["text"] = err
                 return err
+                
         except Exception as e:
-            target_dict["text"] = f"⏳ Connection issue. Retrying... ({str(e)})"
+            target_dict["text"] = f"⏳ Connection issue. Retrying {i+1}/5... ({str(e)})"
             time.sleep(2**i + random.random())
             if i == 4: 
-                err = f"Connection Error: {str(e)}"
+                err = f"Connection Failed: {str(e)}"
                 target_dict["text"] = err
                 return err
     
-    err = "Rate limit exceeded or API error after retries."
+    err = "Rate limit exceeded or API error after 5 retries."
     target_dict["text"] = err
     return err
 
@@ -211,30 +252,46 @@ def run_debate_bg(task_id, topic, ctx, model_id, or_key, db_client):
 # --- Rendering Helper ---
 def render_turn(turn, is_live=False):
     """Renders a single agent's turn, separating thinking from the final response."""
-    # 1. Native API Reasoning
-    if turn.get("thinking"):
-        with st.expander("🧠 Internal Thinking Process", expanded=is_live):
-            st.markdown(turn["thinking"])
-            
+    if not turn: return
+    
     text = turn.get("text", "")
-    if text == "⏳ Reading sources & thinking...":
+    thinking = turn.get("thinking", "")
+    
+    # Render loading placeholders early
+    if text.startswith("⏳"):
         st.caption(text)
+        if thinking:
+            with st.expander("🧠 Internal Thinking Process", expanded=is_live):
+                st.markdown(thinking)
         return
         
-    # 2. Extract inline <think> tags (if model embeds it in content)
+    if not text and not thinking:
+        st.caption("⏳ Waiting for model to begin generating...")
+        return
+
+    # 1. Native API Reasoning (e.g. DeepSeek R1 via Native Spec)
+    if thinking:
+        with st.expander("🧠 Internal Thinking Process", expanded=is_live):
+            st.markdown(thinking)
+            
+    # 2. Extract inline <think> tags (if model embeds it in text content)
     think_match = re.search(r'<think>(.*?)(?:</think>|$)', text, re.DOTALL | re.IGNORECASE)
     if think_match:
         think_content = think_match.group(1).strip()
-        if think_content:
+        # Display inline reasoning if we aren't already displaying native reasoning
+        if think_content and not thinking:
             with st.expander("🧠 Internal Thinking Process", expanded=is_live):
                 st.markdown(think_content)
                 
-        # Remove the think block from final text
+        # Remove the think block from final text cleanly
         text_without_think = re.sub(r'<think>.*?(?:</think>|$)', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
         if text_without_think:
             st.markdown(text_without_think)
+        elif is_live and text.endswith("▌"):
+            st.markdown("▌") # Make sure cursor shows even when only thinking has generated
     else:
-        st.markdown(text)
+        if text:
+            st.markdown(text)
 
 def render_debate(data, is_live_task=False):
     """Renders the full debate transcript, supporting legacy and new structures."""
