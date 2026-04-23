@@ -67,7 +67,7 @@ def extract_text(files, urls):
     return context
 
 def stream_openrouter(api_key, model_id, role, task_prompt, context, target_dict):
-    """Calls OpenRouter API with highly robust streaming, retry, and keep-alive handling."""
+    """Calls OpenRouter API with highly robust streaming, retry, and rate-limit handling."""
     url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -91,7 +91,9 @@ def stream_openrouter(api_key, model_id, role, task_prompt, context, target_dict
     target_dict["text"] = "⏳ Reading sources & connecting..."
     target_dict["thinking"] = ""
 
-    for i in range(5): 
+    max_retries = 7 # Increased retry count to combat rate limits
+    
+    for i in range(max_retries): 
         full_text = ""
         full_thinking = ""
         
@@ -161,70 +163,85 @@ def stream_openrouter(api_key, model_id, role, task_prompt, context, target_dict
                 return full_text
                 
             elif response.status_code == 429:
-                target_dict["text"] = f"⏳ Rate limited. Retrying {i+1}/5..."
-                time.sleep(2**i + random.random())
+                # Rate limited. Check for explicit Retry-After header, fallback to exponential backoff
+                retry_after_str = response.headers.get("Retry-After")
+                if retry_after_str and retry_after_str.isdigit():
+                    wait_time = int(retry_after_str) + 1
+                else:
+                    wait_time = (2 ** i) + random.uniform(2, 5)
+                    
+                target_dict["text"] = f"⏳ Rate limited (429). Cooling down for {wait_time:.1f}s. Retrying {i+1}/{max_retries}..."
+                time.sleep(wait_time)
                 continue
+                
+            elif response.status_code in [502, 503, 504]:
+                # Server overloaded - common with free models.
+                wait_time = (2 ** i) + random.uniform(3, 6)
+                target_dict["text"] = f"⏳ Server overloaded ({response.status_code}). Waiting {wait_time:.1f}s. Retrying {i+1}/{max_retries}..."
+                time.sleep(wait_time)
+                continue
+                
             else:
                 err = f"API Error: {response.status_code} - {response.text}"
                 target_dict["text"] = err
                 return err
                 
         except Exception as e:
-            target_dict["text"] = f"⏳ Connection issue. Retrying {i+1}/5... ({str(e)})"
-            time.sleep(2**i + random.random())
-            if i == 4: 
-                err = f"Connection Failed: {str(e)}"
+            wait_time = (2 ** i) + random.uniform(1, 3)
+            target_dict["text"] = f"⏳ Connection issue. Waiting {wait_time:.1f}s. Retrying {i+1}/{max_retries}... ({str(e)})"
+            time.sleep(wait_time)
+            if i == max_retries - 1: 
+                err = f"Connection Failed after {max_retries} attempts: {str(e)}"
                 target_dict["text"] = err
                 return err
     
-    err = "Rate limit exceeded or API error after 5 retries."
+    err = f"Rate limit exceeded or API error after {max_retries} retries."
     target_dict["text"] = err
     return err
 
 def run_debate_bg(task_id, topic, ctx, model_id, or_key, db_client):
-    """Background thread running a 10-turn debate and pushing streaming updates."""
+    """Background thread running a single round debate and pushing streaming updates."""
     task = st.session_state.tasks[task_id]
     task["turns"] = []
     
     try:
-        # --- 10 Turn Conversation Loop ---
-        for i in range(10):
-            role = "Proponent" if i % 2 == 0 else "Opponent"
-            task["status"] = f"Turn {i+1}/10: {role} is arguing..."
-            
-            turn_dict = {"role": role, "text": "", "thinking": ""}
-            task["turns"].append(turn_dict)
-            
-            # Build clean history (stripping out previous <think> tags so models don't read opponent's minds)
-            clean_history = []
-            for t in task["turns"][:-1]:
-                clean_text = re.sub(r'<think>.*?(?:</think>|$)', '', t['text'], flags=re.DOTALL).strip()
-                clean_history.append(f"{t['role']}: {clean_text}")
-            history_text = "\n\n".join(clean_history)
-            
-            if i == 0:
-                prompt = f"Make your opening argument FOR: {topic}"
-            elif i == 1:
-                prompt = f"Make your opening argument AGAINST: {topic}. Directly address the Proponent's points.\n\nDEBATE HISTORY:\n{history_text}"
-            else:
-                prompt = f"Provide your counter-argument. Address the opponent's latest points and strengthen your case.\n\nDEBATE HISTORY:\n{history_text}"
-                
-            stream_openrouter(or_key, model_id, role, prompt, ctx, turn_dict)
+        # --- 1. Proponent ---
+        task["status"] = "Proponent is arguing..."
+        pro_dict = {"role": "Proponent", "text": "", "thinking": ""}
+        task["turns"].append(pro_dict)
         
-        # --- Judge Evaluation ---
+        pro_prompt = f"Make your strong, comprehensive opening argument FOR: {topic}"
+        stream_openrouter(or_key, model_id, "Proponent", pro_prompt, ctx, pro_dict)
+
+        # Rate Limit Precaution: Force a cooldown delay between API calls
+        task["status"] = "Cooling down to prevent rate limits..."
+        time.sleep(5)
+
+        # --- 2. Opponent ---
+        task["status"] = "Opponent is arguing..."
+        con_dict = {"role": "Opponent", "text": "", "thinking": ""}
+        task["turns"].append(con_dict)
+        
+        # Clean the proponent's text so the opponent doesn't read internal <think> tags
+        clean_pro_text = re.sub(r'<think>.*?(?:</think>|$)', '', pro_dict['text'], flags=re.DOTALL).strip()
+        
+        con_prompt = f"Make your strong, comprehensive argument AGAINST: {topic}.\n\nDirectly address and rebut the Proponent's points:\n[PROPONENT'S ARGUMENT]\n{clean_pro_text}"
+        stream_openrouter(or_key, model_id, "Opponent", con_prompt, ctx, con_dict)
+
+        # Rate Limit Precaution: Force a cooldown delay before the judge
+        task["status"] = "Cooling down to prevent rate limits..."
+        time.sleep(5)
+        
+        # --- 3. Judge Evaluation ---
         task["status"] = "Judge is evaluating the full transcript..."
         
-        # Pass the full clean history to the judge
-        clean_history = []
-        for i, t in enumerate(task["turns"]):
-            clean_text = re.sub(r'<think>.*?(?:</think>|$)', '', t['text'], flags=re.DOTALL).strip()
-            clean_history.append(f"TURN {i+1} - {t['role']}: {clean_text}")
-        full_transcript = "\n\n".join(clean_history)
+        clean_con_text = re.sub(r'<think>.*?(?:</think>|$)', '', con_dict['text'], flags=re.DOTALL).strip()
+        full_transcript = f"PROPONENT:\n{clean_pro_text}\n\nOPPONENT:\n{clean_con_text}"
         
         judge_dict = {"role": "Neutral Judge", "text": "", "thinking": ""}
         task["judge_data"] = judge_dict
         
-        judge_prompt = f"Judge this 10-turn debate objectively based on logical strength, effective rebuttals, and accuracy against provided sources:\n\n{full_transcript}"
+        judge_prompt = f"Judge this debate objectively based on logical strength, effective rebuttals, and accuracy against provided sources:\n\n{full_transcript}"
         stream_openrouter(or_key, model_id, "Neutral Judge", judge_prompt, ctx, judge_dict)
         
         # --- Save ---
@@ -298,7 +315,7 @@ def render_debate(data, is_live_task=False):
     if "turns" in data:
         for i, turn in enumerate(data["turns"]):
             role_icon = "🔵" if turn["role"] == "Proponent" else "🔴"
-            st.markdown(f"<div class='turn-box'><h4>{role_icon} Turn {i+1}: {turn['role']}</h4></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='turn-box'><h4>{role_icon} {turn['role']}</h4></div>", unsafe_allow_html=True)
             
             # Auto-expand the thinking process only if it's the actively generating turn
             is_active_turn = is_live_task and i == len(data["turns"]) - 1 and "judge_data" not in data
@@ -310,7 +327,7 @@ def render_debate(data, is_live_task=False):
             render_turn(data["judge_data"], is_live=is_live_task)
             st.markdown('</div>', unsafe_allow_html=True)
             
-    # Fallback for old debates stored in DB before the 10-turn update
+    # Fallback for old debates stored in DB before structure updates
     elif "pro" in data:
         col1, col2 = st.columns(2)
         with col1:
@@ -362,7 +379,7 @@ with tab1:
         
         can_start = bool(topic.strip()) and has_secrets
 
-        if st.button("🏁 Start 10-Turn Debate Session", disabled=not can_start):
+        if st.button("🏁 Start Debate Session", disabled=not can_start):
             with st.spinner("Extracting sources..."):
                 ctx = extract_text(files, urls)
                 
